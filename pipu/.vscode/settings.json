@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.portWin": "COM4",
+  "idf.portWin": "COM15",
   "idf.toolsPathWin": "C:\\Users\\Gal\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s2"
@@ -23,6 +23,9 @@
     "stdio.h": "c",
     "nvs_flash.h": "c",
     "chrono": "c",
-    "complex": "c"
+    "complex": "c",
+    "esp_event.h": "c",
+    "gpio.h": "c",
+    "uart.h": "c"
   }
 }

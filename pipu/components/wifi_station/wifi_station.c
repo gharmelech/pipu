@@ -6,8 +6,8 @@
 #include "esp_netif.h"
 
 
-#define WIFI_SSID "ssid"
-#define WIFI_PASS "password"
+#define WIFI_SSID "Gal"
+#define WIFI_PASS "1A2b3c4D"
 
 static const char *TAG = "wifi_station";
 
