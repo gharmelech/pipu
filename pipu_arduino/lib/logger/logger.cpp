@@ -5,11 +5,7 @@
 #include <HTTPClient.h>
 
 Logger::Logger()
-{
-    samples = (int16_t*)ps_malloc(MAX_NUM_OF_SAMPLES * sizeof(int16_t));
-    sampleCount = 0;
-    eventJson.reserve(180000);
-}
+{}
 
 Logger::~Logger()
 {
@@ -19,6 +15,14 @@ Logger::~Logger()
 
 void Logger::initLogger(bool clear)
 {
+    samples = (int32_t*)ps_malloc((MAX_NUM_OF_SAMPLES + 10)* sizeof(int32_t));
+    if (samples == NULL)
+        Serial.println("sample buffer allocation failed");
+    else
+        Serial.println("sample buffer allocation success!");
+    sampleCount = 0;
+    eventJson.reserve(MAX_NUM_OF_SAMPLES + 1000);
+
     SSID.begin("cred", false);
     if (clear)
         SSID.clear();
@@ -44,15 +48,32 @@ void Logger::event_catID(String catID)
     this->catID = catID;
 }
 
+void Logger::event_catWeight(String weight)
+{
+    catWeight = weight;
+}
+
+void Logger::event_depositWeight(String weight)
+{
+    depositWeight = weight;
+}
+
 void Logger::event_type(String type)
 {
     eventType = type;
 }
 
-void Logger::event_sample(int16_t sample)
+void Logger::event_sample(int32_t sample)
 {
-    samples[sampleCount++] = sample;
-    if (sampleCount >= 180 * 100)
+    Serial.printf("Logging sample! sample: %d, current sample count: %d\n", sample, sampleCount);
+    delay(500);
+    samples[sampleCount] = sample;
+    Serial.println("logged!");
+    delay(500);
+    sampleCount++;
+    Serial.println("counter advanced");
+    delay(500);
+    if (sampleCount == MAX_NUM_OF_SAMPLES)
         event_send();
 }
 
@@ -63,20 +84,27 @@ void Logger::event_send()
         eventJson = "{\"Type\":\"" + eventType + "\"";
         if (catID.length() > 1)
             eventJson.concat(", \"Cat ID\":\"" + catID + "\"");
-        eventJson.concat(", \"Samples\":[" + String(samples[0]) + "\"");
+        if (catWeight.length() > 1)
+            eventJson.concat(", \"Cat Weight\":" + catWeight);
+        if (depositWeight.length() > 1)
+            eventJson.concat(", \"Deposit Weight\":" + depositWeight);
+        eventJson.concat(", \"Samples\":[" + String(samples[0]));
         for (int i = 1; i < sampleCount; i++)
-            eventJson.concat(", \"" + String(samples[i]) + "\"");
+            eventJson.concat("," + String(samples[i]));
         eventJson.concat("]}");
         post_event(eventJson);
     }
     sampleCount = 0;
     catID.clear();
+    catWeight.clear();
+    depositWeight.clear();
     eventType.clear();
     eventJson.clear();
 }
 
 void Logger::post_event(String json)
 {
+    Serial.println("posting event: " + json);
     HTTPClient http;
     http.begin("http://192.168.88.187:5000/log"); // your URL
     http.addHeader("Content-Type", "application/json"); // header
@@ -99,6 +127,43 @@ void Logger::post_event(String json)
     http.end(); // free resources
 }
 
+int32_t Logger::remote_setting(rcommand cmd, int32_t arg)
+{
+    String cmd_string;
+    switch (cmd)
+    {
+    case start:
+        cmd_string = "start";
+        break;
+    case req_tare:
+        cmd_string = "req_tare";
+        break;
+    case ack_tare:
+        cmd_string = "ack_tare";
+        break;
+    case req_calib:
+        cmd_string = "req_calib";
+        break;
+    case ack_calib:
+        cmd_string = "ack_calib";
+        break;
+    default:
+        cmd_string = "null";
+        break;
+    }
+    HTTPClient http;
+    http.begin("http://192.168.88.187:5000/cmd"); // your URL
+    http.addHeader("Content-Type", "application/json"); // header
+    String json = "{\"cmd\":\"" + cmd_string + "\", \"arg\":\"" + String(arg) + "\"}";
+    Serial.print("Posting JSON: ");
+    Serial.println(json);
+    http.POST(json);
+    String response = http.getString();
+    http.end();
+
+    return response.toInt();
+}
+
 void Logger::set_creds()
 {
     Serial.println("Please enter SSID to use.");
@@ -108,14 +173,15 @@ void Logger::set_creds()
         {
             String ssid = Serial.readStringUntil('\n');
             SSID.putString("ssid", ssid);
-            Serial.println("Please enter password for ssid" + ssid + ".");
+            Serial.println("Please enter password for ssid \"" + ssid + "\".");
             while(true)
             {
                 if (Serial.available())
                 {
                     String pass = Serial.readStringUntil('\n');
                     SSID.putString("pass", pass);
-                    break;
+                    Serial.println("Credantials saved!");
+                    return;
                 }
             }
         }
