@@ -65,14 +65,14 @@ void Logger::event_type(String type)
 
 void Logger::event_sample(int32_t sample)
 {
-    Serial.printf("Logging sample! sample: %d, current sample count: %d\n", sample, sampleCount);
-    delay(500);
+    // Serial.printf("Logging sample! sample: %d, current sample count: %d\n", sample, sampleCount);
+    // delay(500);
     samples[sampleCount] = sample;
-    Serial.println("logged!");
-    delay(500);
+    // Serial.println("logged!");
+    // delay(500);
     sampleCount++;
-    Serial.println("counter advanced");
-    delay(500);
+    // Serial.println("counter advanced");
+    // delay(500);
     if (sampleCount == MAX_NUM_OF_SAMPLES)
         event_send();
 }

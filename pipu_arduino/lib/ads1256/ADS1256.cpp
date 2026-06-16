@@ -46,9 +46,6 @@ void ADS1256::begin(bool clear)
 
     digitalWrite(SCALE_CS, HIGH);
     calibrate();
-
-    current_weight = getWeight();
-    box_weight = current_weight;
 }
 
 ADS1256::~ADS1256()
@@ -61,6 +58,7 @@ void ADS1256::calibrate()
     {
         calib_factor = params.getDouble("calib_factor");
         offset       = params.getInt("offset");
+        box_weight = (params.isKey("box_weight")) ? params.getInt("box_weight") : 0;
         Serial.printf("Loaded calibration paramters: offset = %d, factor = %f\n", offset, calib_factor);
         return;
     }
@@ -139,7 +137,6 @@ void ADS1256::calibrate()
             Serial.printf("Restart and try again!\n");
             while(1){}
         }    
-
     }
 }
 
@@ -174,6 +171,7 @@ void ADS1256::setManFactor(int32_t setting)
 void ADS1256::updateBoxWeight()
 {
     box_weight = getWeight();
+    params.putInt("box_weight", box_weight);
 }
 
 int32_t ADS1256::getSample()

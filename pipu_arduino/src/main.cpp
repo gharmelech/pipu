@@ -7,20 +7,22 @@
 
 // #define NO_SCALE
 // #define SCALE_DEBUG
+#define DEBUG_PRINTS 0
 
 #define LID_GPIO 11
 #define USER_BUTTON 0
 #define SETTING_HOLD_THRESH_S 3 // seconds to hold user button in order to enter remote setting mode
 #define REMOTE_SETTINGS_TIMEOUT_S 30 // max time to wait for remote setting reply
 #define TICKS_PER_SEC 1000000
-#define ZEROING_INTERVAL_SEC 10
+#define SAMPLE_PRINT_INTERVAL_SEC 2
 #define REPORT_INTERVAL_SEC 60
+#define ZEROING_INTERVAL_SEC 30
 #define MAX_DEPOSIT_TIMME_SEC (3 * 60)
 #define MAX_DEPOSIT_TIMME_MS (MAX_DEPOSIT_TIMME_SEC * 1000)
-#define SETTLING_TIMME_SEC 5
 #define SPS 100
 #define CAT_THRESH_G 2500
-#define MIN_BOX_WEIGHT_G 3000
+#define MIN_BOX_WEIGHT_G 2000
+#define SETTLING_TIMME_SEC 3
 #define STEADY_STATE_THRESH_G 10
 #define DROP_THRESH_G (-1)
 #define SPIKE_THRESH_G 3
@@ -48,6 +50,7 @@ static fsm_state state = idle;
 static uint32_t loopCount = 0;
 static uint32_t sampleCount = 0;
 static uint32_t transientCoundown = 0;
+static uint32_t lastSamplePrint = 0;
 static uint32_t lastReport = 0;
 static uint32_t lastZero = 0;
 static int32_t currentSample_g = 0;
@@ -73,6 +76,7 @@ static bool zeroing     = false;
 hw_timer_t *oneSecTimer = NULL;
 
 void remote_settings();
+void tare_scale();
 
 void IRAM_ATTR oneSecISR()
 {
@@ -190,31 +194,14 @@ void loop()
     }
     if (hold_cnt == SETTING_HOLD_THRESH_S * 10)
     {
+      detachInterrupt(LID_GPIO);
       Serial.println("Starting remote settings");
       // remote_settings();
       LED_TOGGLE
-      scale.setManOffset(scale.getSample());
-      while(!digitalRead(USER_BUTTON))
-      {
-        delay(100);
-      }
-    }
-    //wait for box
-    int32_t baseWeight = scale.getWeight();
-    while(true)
-    {
-      delay(1000);
-      if (scale.getWeight() - baseWeight > MIN_BOX_WEIGHT_G)
-      {
-        delay(500);
-        scale.updateBoxWeight();
-        logger.event_type("scale_tare");
-        logger.event_sample(scale.getBoxWeight());
-        logger.event_send();
-        LED_TOGGLE
-        delay(500);
-        LED_TOGGLE
-      }
+      delay(500);
+      tare_scale();
+      state = idle;
+      attachInterrupt(LID_GPIO, lidISR, RISING);
     }
   }
   if (xSemaphoreTake(oneSecSemaphore, 0) == pdTRUE)
@@ -224,15 +211,21 @@ void loop()
       zeroing = true;
       lastZero = secCounter;
     }
+#if DEBUG_PRINTS
+    if (secCounter - lastSamplePrint >= SAMPLE_PRINT_INTERVAL_SEC)
+    {
+      Serial.printf("%d\n", previousSample_g);
+      lastSamplePrint = secCounter;
+    }
     if (secCounter - lastReport >= REPORT_INTERVAL_SEC)
     {
       Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_SEC);
-#ifdef REPORT_LOOP
-      logger.post_event(String("{\"Loop count\":" + loopCount + '}'));
-#endif
+      Serial.printf("Current state: %d\n", state);
+      
       lastReport = secCounter;
       loopCount = 0;
     }
+#endif
     isSec = true;
   }
   //FSM
@@ -248,6 +241,7 @@ void loop()
     case idle:
       if (xSemaphoreTake(lidSemaphore, 0) == pdTRUE)
       {
+        detachInterrupt(LID_GPIO);
         state = clean;
       }
       else if ((currentSample_g - scale.getBoxWeight() > CAT_THRESH_G) && isSec) // A cat is inside the box! align to sec counter
@@ -259,6 +253,7 @@ void loop()
       }
       else if (zeroing)
       {
+        Serial.println("Refreshing offset such that current sample = boxWeight");
         scale.refreshOffset();
         zeroing = false;
       }
@@ -291,12 +286,16 @@ void loop()
       {
         depositTimerSec++;
         secSample_g[0] = secSample_g[0] / SPS;
-        if (((secSample_g[1] - secSample_g[0]) > CAT_THRESH_G )|| (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
+        if (((secSample_g[1] - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
         {
           if (rfid.available())
           {
             catID = rfid.getLastTagRead();
             logger.event_catID(String(catID));
+          }
+          else 
+          {
+            logger.event_catID("Unknown");
           }
 
           if (isNumberTwo)
@@ -341,6 +340,7 @@ void loop()
             secSample_g[0] = 0;
             if (windowMax_g - windowMin_g <= STEADY_STATE_THRESH_G)
               steadyState = true;
+              Serial.println("Steady state");
           } 
         }
       }
@@ -348,7 +348,7 @@ void loop()
     case clean:
       if (!digitalRead(LID_GPIO)) //reading low -> lid closed
       {
-        delay(100); // debunce connection and verify
+        delay(1000); // debunce connection and verify
         if (!digitalRead(LID_GPIO)) //reading low -> lid closed
         {
           logger.event_sample(scale.getBoxWeight());
@@ -358,6 +358,7 @@ void loop()
           logger.event_send();
           state = idle;
           rfid.restart();
+          attachInterrupt(LID_GPIO, lidISR, RISING);
         }
       }
       break;
@@ -426,4 +427,43 @@ void remote_settings()
     logger.remote_setting(ack_calib, scale.getWeight());
   }
   Serial.println("Exiting remote settings");
+}
+
+void tare_scale()
+{
+  while(!digitalRead(USER_BUTTON)) //wait for button release
+  {
+    delay(100);
+  }
+  delay(1000);
+  scale.setManOffset(scale.getSample());
+  int32_t baseWeight = scale.getWeight();
+  Serial.println("Scale tared");
+  LED_TOGGLE // confirm offset saved
+  delay(500);
+  LED_TOGGLE
+  //wait for box
+  while(true)
+  {
+    delay(1000);
+    Serial.println("Waiting for lid closure");
+    digitalWrite(LED_BUILTIN, HIGH);
+    if ((scale.getWeight() - baseWeight > MIN_BOX_WEIGHT_G) && (!digitalRead(LID_GPIO)))
+    {
+      delay(1000);
+      Serial.println("Lid closed, updating box weight");
+      scale.updateBoxWeight();
+      Serial.println("Box weight updated, sending event");
+      logger.event_type("scale_tare");
+      logger.event_sample(baseWeight);
+      logger.event_sample(scale.getBoxWeight());
+      logger.event_send();
+      LED_TOGGLE
+      delay(500);
+      LED_TOGGLE
+      break;
+      state = idle;
+    }
+  }
+  Serial.println("Event sent, resuming normal operation");
 }
