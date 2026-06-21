@@ -21,7 +21,7 @@ void Logger::initLogger(bool clear)
     else
         Serial.println("sample buffer allocation success!");
     sampleCount = 0;
-    eventJson.reserve(MAX_NUM_OF_SAMPLES + 1000);
+    eventJson.reserve(MAX_NUM_OF_SAMPLES * MAX_NUM_OF_CHARS + 1000);
 
     SSID.begin("cred", false);
     if (clear)
@@ -74,7 +74,10 @@ void Logger::event_sample(int32_t sample)
     // Serial.println("counter advanced");
     // delay(500);
     if (sampleCount == MAX_NUM_OF_SAMPLES)
+    {
+        eventType = "max samples";
         event_send();
+    }
 }
 
 void Logger::event_send()

@@ -17,6 +17,10 @@ void ADS1256::begin(bool clear)
         params.clear();
     }
 
+    pinMode(SCALE_RST, OUTPUT);
+    pinMode(SCALE_CS, OUTPUT);
+    pinMode(SCALE_DRDY, INPUT);
+
     digitalWrite (SCALE_RST, LOW);
     delayMicroseconds(10);
     digitalWrite (SCALE_RST, HIGH);
@@ -45,6 +49,7 @@ void ADS1256::begin(bool clear)
     sendCmd(SCALE_CMD_WAKEUP);
 
     digitalWrite(SCALE_CS, HIGH);
+    // Serial.println("Skipping calibration, don't forget to remove this!!!");
     calibrate();
 }
 
@@ -166,6 +171,11 @@ void ADS1256::setManFactor(int32_t setting)
 {
     calib_factor = (double)setting / 10000.0;
     params.putDouble("calib_factor", calib_factor);
+}
+
+bool ADS1256::available()
+{
+    return (!digitalRead(SCALE_DRDY));
 }
 
 void ADS1256::updateBoxWeight()

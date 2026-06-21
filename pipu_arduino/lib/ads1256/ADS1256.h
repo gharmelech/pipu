@@ -65,6 +65,7 @@ public:
     void refreshOffset();
     void setManOffset(int32_t setting);
     void setManFactor(int32_t setting);
+    bool available();
     int32_t getSample();
     int32_t getWeight();
     int32_t getBoxWeight();

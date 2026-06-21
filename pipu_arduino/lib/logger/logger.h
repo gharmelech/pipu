@@ -4,7 +4,8 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
-#define MAX_NUM_OF_SAMPLES (100 * 180)
+#define MAX_NUM_OF_SAMPLES (100 * 180) // 100 sps * 3 minutes
+#define MAX_NUM_OF_CHARS 5 // max sample is 26kg in 1g res
 
 enum rcommand
 {

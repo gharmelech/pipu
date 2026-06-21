@@ -7,7 +7,7 @@
 
 // #define NO_SCALE
 // #define SCALE_DEBUG
-#define DEBUG_PRINTS 0
+#define DEBUG_PRINTS 1
 
 #define LID_GPIO 11
 #define USER_BUTTON 0
@@ -17,6 +17,7 @@
 #define SAMPLE_PRINT_INTERVAL_SEC 2
 #define REPORT_INTERVAL_SEC 60
 #define ZEROING_INTERVAL_SEC 30
+#define MAX_ZEORING_DELTA_G 10
 #define MAX_DEPOSIT_TIMME_SEC (3 * 60)
 #define MAX_DEPOSIT_TIMME_MS (MAX_DEPOSIT_TIMME_SEC * 1000)
 #define SPS 100
@@ -62,7 +63,8 @@ static int32_t windowAvg_g = 0;
 static int32_t delta_g = 0;
 static int32_t depositWeight = 0;
 static int32_t catWeight = 0;
-static bool isSec = false;
+static bool zeroingInterval = false;
+static bool oneSecInterval  = false;
 static bool steadyState = false;
 static bool isNumberTwo = false;
 Logger logger;
@@ -72,11 +74,19 @@ static const char *catID;
 static bool clear_mem   = false;
 static bool clear_cred  = false;
 static bool clear_scale = false;
-static bool zeroing     = false;
 hw_timer_t *oneSecTimer = NULL;
 
 void remote_settings();
 void tare_scale();
+void check_user_button();
+void user_button_func();
+void periodicals();
+void idle_func();
+void deposit_func();
+void clean_func();
+void rfid_only();
+void scale_fsm();
+void check_zero();
 
 void IRAM_ATTR oneSecISR()
 {
@@ -182,212 +192,41 @@ void setup()
 
 void loop()
 {
-  if (!digitalRead(USER_BUTTON))
-  {
-    Serial.println("userbutton pressed");
-    int32_t hold_cnt = 0;
-    for (;hold_cnt < SETTING_HOLD_THRESH_S * 10; hold_cnt++) // check every 100ms
-    {
-      delay(100);
-      if(digitalRead(USER_BUTTON))
-        break;
-    }
-    if (hold_cnt == SETTING_HOLD_THRESH_S * 10)
-    {
-      detachInterrupt(LID_GPIO);
-      Serial.println("Starting remote settings");
-      // remote_settings();
-      LED_TOGGLE
-      delay(500);
-      tare_scale();
-      state = idle;
-      attachInterrupt(LID_GPIO, lidISR, RISING);
-    }
-  }
-  if (xSemaphoreTake(oneSecSemaphore, 0) == pdTRUE)
-  {
-    if (secCounter - lastZero >= ZEROING_INTERVAL_SEC)
-    {
-      zeroing = true;
-      lastZero = secCounter;
-    }
-#if DEBUG_PRINTS
-    if (secCounter - lastSamplePrint >= SAMPLE_PRINT_INTERVAL_SEC)
-    {
-      Serial.printf("%d\n", previousSample_g);
-      lastSamplePrint = secCounter;
-    }
-    if (secCounter - lastReport >= REPORT_INTERVAL_SEC)
-    {
-      Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_SEC);
-      Serial.printf("Current state: %d\n", state);
-      
-      lastReport = secCounter;
-      loopCount = 0;
-    }
-#endif
-    isSec = true;
-  }
-  //FSM
+  check_user_button();
+  periodicals();
 #ifndef NO_SCALE
-  previousSample_g = currentSample_g;
-  currentSample_g = scale.getWeight();
-#ifdef SCALE_DEBUG
-  delay(1000); // reduce loop rate to 
-  Serial.printf("current sample: %d grams\n", currentSample_g);
-#else
-  switch (state)
-  {
-    case idle:
-      if (xSemaphoreTake(lidSemaphore, 0) == pdTRUE)
-      {
-        detachInterrupt(LID_GPIO);
-        state = clean;
-      }
-      else if ((currentSample_g - scale.getBoxWeight() > CAT_THRESH_G) && isSec) // A cat is inside the box! align to sec counter
-      {
-        state = deposit;
-        depositTimerSec = 0;
-        sampleCount = 0;
-        steadyState = false;
-      }
-      else if (zeroing)
-      {
-        Serial.println("Refreshing offset such that current sample = boxWeight");
-        scale.refreshOffset();
-        zeroing = false;
-      }
-      break;
-    case deposit:
-      sampleCount++;
-      logger.event_sample(currentSample_g);
-      secSample_g[0] += currentSample_g;
-      if (steadyState)
-      {
-        delta_g = currentSample_g - previousSample_g;
-        if (!isNumberTwo)
-        {
-          if (delta_g < DROP_THRESH_G) // very small drop in weight
-          {
-            transientCoundown = MAX_SAMPLES_BETWEEN_TRANSIENT_PARTS;
-          }
-          else if (transientCoundown > 0)
-          {
-            transientCoundown--;
-            if (delta_g > SPIKE_THRESH_G) // weight spike
-            {
-              isNumberTwo = true;
-            }
-          }
-        }
-      }
-
-      if (isSec) // full second
-      {
-        depositTimerSec++;
-        secSample_g[0] = secSample_g[0] / SPS;
-        if (((secSample_g[1] - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
-        {
-          if (rfid.available())
-          {
-            catID = rfid.getLastTagRead();
-            logger.event_catID(String(catID));
-          }
-          else 
-          {
-            logger.event_catID("Unknown");
-          }
-
-          if (isNumberTwo)
-            logger.event_type("2");
-          else
-            logger.event_type("1");
-
-          isNumberTwo = false;
-          depositWeight = scale.getBoxWeight();
-          scale.updateBoxWeight();
-          depositWeight = scale.getBoxWeight() - depositWeight;
-          logger.event_depositWeight(String(depositWeight));
-          catWeight = windowAvg_g - depositWeight;
-          logger.event_catWeight(String(catWeight));
-          logger.event_send();
-          #pragma unroll
-          for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
-          {
-            secSample_g[i] = 0;
-          }
-          state = idle;
-        }
-        else
-        {
-          if (!steadyState)
-          {
-            transientCoundown = 0;
-            windowAvg_g = 0;
-            windowMax_g = secSample_g[0];
-            windowMin_g = secSample_g[0];
-            for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
-            {
-              windowMax_g = (secSample_g[i] > windowMax_g) ? secSample_g[i] : windowMax_g;
-              windowMin_g = (secSample_g[i] < windowMin_g) ? secSample_g[i] : windowMin_g;
-              windowAvg_g += secSample_g[i];
-              if (i > 0)
-              {
-                secSample_g[i] = secSample_g[i - 1];
-              }
-            }
-            windowAvg_g = windowAvg_g / SETTLING_TIMME_SEC;
-            secSample_g[0] = 0;
-            if (windowMax_g - windowMin_g <= STEADY_STATE_THRESH_G)
-              steadyState = true;
-              Serial.println("Steady state");
-          } 
-        }
-      }
-      break;
-    case clean:
-      if (!digitalRead(LID_GPIO)) //reading low -> lid closed
-      {
-        delay(1000); // debunce connection and verify
-        if (!digitalRead(LID_GPIO)) //reading low -> lid closed
-        {
-          logger.event_sample(scale.getBoxWeight());
-          scale.updateBoxWeight();
-          logger.event_sample(scale.getBoxWeight());
-          logger.event_type("Clean");
-          logger.event_send();
-          state = idle;
-          rfid.restart();
-          attachInterrupt(LID_GPIO, lidISR, RISING);
-        }
-      }
-      break;
-  }
-  #endif // #ifdef SCALE_DEBUG
+  scale_fsm();
 #else// #ifndef NO_SCALE
-    if (state == clean)
-    {
-      if (!digitalRead(LID_GPIO)) //reading low -> lid closed
-      {
-        delay(100); // debunce connection and verify
-        if (!digitalRead(LID_GPIO)) //reading low -> lid closed
-        {
-          rfid.restart();
-          state = idle;
-        }
-      }
-    }
-    else if (rfid.available())
-    {
-      logger.event_sample(1);
-      catID = rfid.getLastTagRead();
-      logger.event_catID(String(catID));
-      logger.event_type("rfid_only");
-      logger.event_send();
-    }
+  rfid_only();
 #endif
   loopCount++;
-  isSec = false;
+}
+
+inline void scale_fsm()
+{
+  if (scale.available())
+  {
+    previousSample_g = currentSample_g;
+    currentSample_g = scale.getWeight();
+#ifdef SCALE_DEBUG
+    delay(1000); // reduce loop rate to 1SPS
+    Serial.printf("current sample: %d grams, %d counts\n", currentSample_g, scale.getSample());
+#else
+    switch (state)
+    {
+      case idle:
+        idle_func();
+        break;
+      case deposit:
+        deposit_func();
+        break;
+      case clean:
+        clean_func();
+        break;
+    }
+#endif // #ifdef SCALE_DEBUG
+    oneSecInterval = false;
+  }
 }
 
 inline bool send_remote_cmd(rcommand cmd, int32_t arg = 0)
@@ -401,6 +240,7 @@ inline bool send_remote_cmd(rcommand cmd, int32_t arg = 0)
   }
   return ((timeout == 0) ? false : true);
 }
+
 void remote_settings()
 {
   Serial.println("Entered remote settings mode");
@@ -429,7 +269,35 @@ void remote_settings()
   Serial.println("Exiting remote settings");
 }
 
-void tare_scale()
+inline void check_user_button()
+{
+  if (!digitalRead(USER_BUTTON))
+  {
+    Serial.println("userbutton pressed");
+    int32_t hold_cnt = 0;
+    for (;hold_cnt < SETTING_HOLD_THRESH_S * 10; hold_cnt++) // check every 100ms
+    {
+      delay(100);
+      if(digitalRead(USER_BUTTON))
+        break;
+    }
+    if (hold_cnt == SETTING_HOLD_THRESH_S * 10)
+      user_button_func();
+  }
+}
+
+inline void user_button_func()
+{
+  detachInterrupt(LID_GPIO);
+  // remote_settings();
+  LED_TOGGLE
+  delay(500);
+  tare_scale();
+  state = idle;
+  attachInterrupt(LID_GPIO, lidISR, RISING);
+}
+
+inline void tare_scale()
 {
   while(!digitalRead(USER_BUTTON)) //wait for button release
   {
@@ -448,7 +316,8 @@ void tare_scale()
     delay(1000);
     Serial.println("Waiting for lid closure");
     digitalWrite(LED_BUILTIN, HIGH);
-    if ((scale.getWeight() - baseWeight > MIN_BOX_WEIGHT_G) && (!digitalRead(LID_GPIO)))
+    // if ((scale.getWeight() - baseWeight > MIN_BOX_WEIGHT_G) && (!digitalRead(LID_GPIO)))
+    if (!digitalRead(LID_GPIO))
     {
       delay(1000);
       Serial.println("Lid closed, updating box weight");
@@ -466,4 +335,193 @@ void tare_scale()
     }
   }
   Serial.println("Event sent, resuming normal operation");
+}
+
+inline void periodicals()
+{
+  if (xSemaphoreTake(oneSecSemaphore, 0) == pdTRUE)
+    {
+      if (secCounter - lastZero >= ZEROING_INTERVAL_SEC)
+      {
+        zeroingInterval = true;
+        lastZero = secCounter;
+      }
+#if DEBUG_PRINTS
+      if (secCounter - lastSamplePrint >= SAMPLE_PRINT_INTERVAL_SEC)
+      {
+        Serial.printf("%d\n", previousSample_g);
+        lastSamplePrint = secCounter;
+      }
+      if (secCounter - lastReport >= REPORT_INTERVAL_SEC)
+      {
+        Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_SEC);
+        Serial.printf("Current state: %d\n", state);
+        Serial.printf("Box weight: %d\n", scale.getBoxWeight());
+
+        lastReport = secCounter;
+        loopCount = 0;
+      }
+#endif
+      oneSecInterval = true;
+    }
+}
+
+inline void idle_func()
+{
+  if (xSemaphoreTake(lidSemaphore, 0) == pdTRUE)
+  {
+    detachInterrupt(LID_GPIO);
+    state = clean;
+  }
+  else if ((currentSample_g - scale.getBoxWeight() > CAT_THRESH_G) && oneSecInterval) // A cat is inside the box! align to sec counter
+  {
+    state = deposit;
+    depositTimerSec = 0;
+    sampleCount = 0;
+    steadyState = false;
+  }
+  else if (zeroingInterval)
+  {
+    check_zero();
+  }
+}
+
+inline void check_zero()
+{
+  int32_t delta = scale.getBoxWeight() - scale.getWeight();
+  if ((delta > MAX_ZEORING_DELTA_G) || (delta < -MAX_ZEORING_DELTA_G))
+    scale.refreshOffset();
+  zeroingInterval = false;
+}
+
+inline void deposit_func()
+{
+  sampleCount++;
+  logger.event_sample(currentSample_g);
+  secSample_g[0] += currentSample_g;
+  if (steadyState)
+  {
+    delta_g = currentSample_g - previousSample_g;
+    if (!isNumberTwo)
+    {
+      if (delta_g < DROP_THRESH_G) // very small drop in weight
+      {
+        transientCoundown = MAX_SAMPLES_BETWEEN_TRANSIENT_PARTS;
+      }
+      else if (transientCoundown > 0)
+      {
+        transientCoundown--;
+        if (delta_g > SPIKE_THRESH_G) // weight spike
+        {
+          isNumberTwo = true;
+        }
+      }
+    }
+  }
+
+  if (oneSecInterval) // full second
+  {
+    depositTimerSec++;
+    secSample_g[0] = secSample_g[0] / SPS;
+    if (((secSample_g[1] - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
+    {
+      if (rfid.available())
+      {
+        catID = rfid.getLastTagRead();
+        logger.event_catID(String(catID));
+      }
+      else 
+      {
+        logger.event_catID("Unknown");
+      }
+
+      if (isNumberTwo)
+        logger.event_type("2");
+      else
+        logger.event_type("1");
+
+      isNumberTwo = false;
+      depositWeight = scale.getBoxWeight();
+      scale.updateBoxWeight();
+      depositWeight = scale.getBoxWeight() - depositWeight;
+      logger.event_depositWeight(String(depositWeight));
+      catWeight = windowAvg_g - depositWeight;
+      logger.event_catWeight(String(catWeight));
+      logger.event_send();
+      #pragma unroll
+      for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
+      {
+        secSample_g[i] = 0;
+      }
+      state = idle;
+    }
+    else
+    {
+      if (!steadyState)
+      {
+        transientCoundown = 0;
+        windowAvg_g = 0;
+        windowMax_g = secSample_g[0];
+        windowMin_g = secSample_g[0];
+        for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
+        {
+          windowMax_g = (secSample_g[i] > windowMax_g) ? secSample_g[i] : windowMax_g;
+          windowMin_g = (secSample_g[i] < windowMin_g) ? secSample_g[i] : windowMin_g;
+          windowAvg_g += secSample_g[i];
+          if (i > 0)
+          {
+            secSample_g[i] = secSample_g[i - 1];
+          }
+        }
+        windowAvg_g = windowAvg_g / SETTLING_TIMME_SEC;
+        secSample_g[0] = 0;
+        if (windowMax_g - windowMin_g <= STEADY_STATE_THRESH_G)
+          steadyState = true;
+          Serial.println("Steady state");
+      } 
+    }
+  }
+}
+
+inline void clean_func()
+{
+  if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+  {
+    delay(1000); // debunce connection and verify
+    if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+    {
+      logger.event_sample(scale.getBoxWeight());
+      scale.updateBoxWeight();
+      logger.event_sample(scale.getBoxWeight());
+      logger.event_type("Clean");
+      logger.event_send();
+      state = idle;
+      rfid.restart();
+      attachInterrupt(LID_GPIO, lidISR, RISING);
+    }
+  }
+}
+
+inline void rfid_only()
+{
+  if (state == clean)
+  {
+    if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+    {
+      delay(100); // debunce connection and verify
+      if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+      {
+        rfid.restart();
+        state = idle;
+      }
+    }
+  }
+  else if (rfid.available())
+  {
+    logger.event_sample(1);
+    catID = rfid.getLastTagRead();
+    logger.event_catID(String(catID));
+    logger.event_type("rfid_only");
+    logger.event_send();
+  }
 }
