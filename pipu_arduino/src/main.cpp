@@ -474,7 +474,7 @@ inline void deposit_func()
       scale.updateBoxWeight();
       depositWeight = scale.getBoxWeight() - depositWeight;
       logger.event_depositWeight(String(depositWeight));
-      catWeight = windowAvg_g - depositWeight;
+      catWeight = windowAvg_g - scale.getBoxWeight();
       logger.event_catWeight(String(catWeight));
       logger.event_send();
       #pragma unroll
