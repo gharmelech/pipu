@@ -8,6 +8,7 @@
 // #define NO_SCALE
 // #define SCALE_DEBUG
 #define DEBUG_PRINTS 1
+#define SEND_SNAPSHOT 1
 
 #define LID_GPIO 11
 #define USER_BUTTON 0
@@ -15,7 +16,8 @@
 #define REMOTE_SETTINGS_TIMEOUT_S 30 // max time to wait for remote setting reply
 #define TICKS_PER_SEC 1000000
 #define SAMPLE_PRINT_INTERVAL_SEC 2
-#define REPORT_INTERVAL_SEC 60
+#define SNAPSHOT_INTERVAL_MIN 15
+#define REPORT_INTERVAL_MIN 1
 #define ZEROING_INTERVAL_SEC 30
 #define MAX_ZEORING_DELTA_G 10
 #define MAX_DEPOSIT_TIMME_SEC (3 * 60)
@@ -49,6 +51,8 @@ volatile uint32_t secCounter = 0;
 volatile uint32_t depositTimerSec = 0;
 static fsm_state state = idle;
 static uint32_t loopCount = 0;
+static uint32_t snapshotLoopCount[SNAPSHOT_INTERVAL_MIN] = {0};
+static uint32_t snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
 static uint32_t sampleCount = 0;
 static uint32_t transientCoundown = 0;
 static uint32_t lastSamplePrint = 0;
@@ -188,6 +192,7 @@ void setup()
   timerAttachInterrupt(oneSecTimer, &oneSecISR, true);
   timerAlarmWrite(oneSecTimer, TICKS_PER_SEC, true);
   timerAlarmEnable(oneSecTimer);
+  snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
 }
 
 void loop()
@@ -352,11 +357,31 @@ inline void periodicals()
         Serial.printf("%d\n", previousSample_g);
         lastSamplePrint = secCounter;
       }
-      if (secCounter - lastReport >= REPORT_INTERVAL_SEC)
+      if (secCounter - lastReport >= REPORT_INTERVAL_MIN * 60)
       {
-        Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_SEC);
+        Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_MIN * 60);
         Serial.printf("Current state: %d\n", state);
         Serial.printf("Box weight: %d\n", scale.getBoxWeight());
+#if SEND_SNAPSHOT
+        snapshotLoopCount[--snapeshotTimer] = loopCount;
+        if (snapeshotTimer == 0)
+        {
+          uint32_t avg = snapshotLoopCount[0];
+          uint32_t max = snapshotLoopCount[0];
+          uint32_t min = snapshotLoopCount[0];
+          for (int i = 1; i < SNAPSHOT_INTERVAL_MIN; i++)
+          {
+            max = (snapshotLoopCount[i] > max) ? snapshotLoopCount[i] : max;
+            min = (snapshotLoopCount[i] < min) ? snapshotLoopCount[i] : min;
+            avg += snapshotLoopCount[i];
+          }
+          avg = avg / SNAPSHOT_INTERVAL_MIN;
+          char json [256];
+          snprintf (json, sizeof(json),"{\"Type\":\"Snapshot\",\"LoopCnt Avg\":\"%d\", \"LoopCnt Max\":\"%d\", \"LoopCnt Min\":\"%d\", \"State\":\"%d\", \"Current boxWeight\":\"%d\", \"Current weight\":\"%d\"}", avg, max, min, state, scale.getBoxWeight(), scale.getWeight());
+          logger.post_event(String(json));
+          snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
+        }
+#endif
 
         lastReport = secCounter;
         loopCount = 0;
@@ -423,7 +448,7 @@ inline void deposit_func()
   {
     depositTimerSec++;
     secSample_g[0] = secSample_g[0] / SPS;
-    if (((secSample_g[1] - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
+    if (((windowAvg_g - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
     {
       if (rfid.available())
       {
@@ -476,8 +501,10 @@ inline void deposit_func()
         windowAvg_g = windowAvg_g / SETTLING_TIMME_SEC;
         secSample_g[0] = 0;
         if (windowMax_g - windowMin_g <= STEADY_STATE_THRESH_G)
+        {
           steadyState = true;
           Serial.println("Steady state");
+        }
       } 
     }
   }
