@@ -448,7 +448,7 @@ inline void deposit_func()
   {
     depositTimerSec++;
     secSample_g[0] = secSample_g[0] / SPS;
-    if (((windowAvg_g - secSample_g[0]) > CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
+    if ((secSample_g[0] - scale.getBoxWeight() < CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
     {
       if (rfid.available())
       {
