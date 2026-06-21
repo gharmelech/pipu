@@ -121,6 +121,10 @@ void setup()
 
   Serial.begin(115200);
   delay(5000);
+  if (!Serial)
+  {
+    Serial.end();
+  }
   Serial.printf("Starting\n RST Cnt: %d\n", resetCount);
   
   if (clear_mem)
