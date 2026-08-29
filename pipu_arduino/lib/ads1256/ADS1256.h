@@ -61,7 +61,7 @@ private:
 public:
     ADS1256();
     void begin(bool clear = false);
-    void updateBoxWeight();
+    void updateBoxWeight(int32_t boxWeight);
     void refreshOffset();
     void setManOffset(int32_t setting);
     void setManFactor(int32_t setting);

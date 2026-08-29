@@ -147,6 +147,7 @@ void ADS1256::calibrate()
 
 void ADS1256::refreshOffset()
 {
+    while(digitalRead(SCALE_DRDY)){} // wait for sample
     offset = getSample() - (int32_t)((double)box_weight * calib_factor);
     params.putInt("offset", offset); // update NVM
 }
@@ -178,9 +179,10 @@ bool ADS1256::available()
     return (!digitalRead(SCALE_DRDY));
 }
 
-void ADS1256::updateBoxWeight()
+void ADS1256::updateBoxWeight(int32_t boxWeight)
 {
-    box_weight = getWeight();
+    
+    box_weight = boxWeight;
     params.putInt("box_weight", box_weight);
 }
 
