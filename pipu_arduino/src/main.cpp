@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include <algorithm>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 #include "SPI.h"
 #include "ADS1256.h"
 #include "RFID.h"
@@ -8,94 +11,143 @@
 // #define NO_SCALE
 // #define SCALE_DEBUG
 #define DEBUG_PRINTS 1
+#define DEBUG 0
 #define SEND_SNAPSHOT 1
 
 #define LID_GPIO 11
 #define USER_BUTTON 0
-#define SETTING_HOLD_THRESH_S 3 // seconds to hold user button in order to enter remote setting mode
-#define REMOTE_SETTINGS_TIMEOUT_S 30 // max time to wait for remote setting reply
+#define SETTING_HOLD_THRESH_SEC 3 // seconds to hold user button in order to enter remote setting mode
+#define REMOTE_SETTINGS_TIMEOUT_SEC 30 // max time to wait for remote setting reply
 #define TICKS_PER_SEC 1000000
 #define SAMPLE_PRINT_INTERVAL_SEC 2
 #define SNAPSHOT_INTERVAL_MIN 15
 #define REPORT_INTERVAL_MIN 1
 #define ZEROING_INTERVAL_SEC 30
-#define MAX_ZEORING_DELTA_G 10
-#define MAX_DEPOSIT_TIMME_SEC (3 * 60)
-#define MAX_DEPOSIT_TIMME_MS (MAX_DEPOSIT_TIMME_SEC * 1000)
+#define MIN_ZEROING_DELTA_G 2
+#define MAX_ZEROING_DELTA_G 15
+#define MAX_DEPOSIT_WEIGHT_G 250
+#define MIN_DEPOSIT_TIME_SEC 10
+
 #define SPS 100
-#define CAT_THRESH_G 2500
-#define MIN_BOX_WEIGHT_G 2000
-#define SETTLING_TIMME_SEC 3
-#define STEADY_STATE_THRESH_G 10
-#define DROP_THRESH_G (-1)
-#define SPIKE_THRESH_G 3
-#define MAX_DEPOSIT_LEN_S 300
+#define SAMPLE_BUFFER_SEC 8
+#define SAMPLE_BUFFER_SIZE (SAMPLE_BUFFER_SEC * SPS)
+#define CAT_THRESH_G 1500
+#define MAX_DEPOSIT_LEN_SEC 300
 #define MAX_SAMPLES_BETWEEN_TRANSIENT_PARTS (SPS / 5) // transient should be less than 0.2 sec
 #define RESETS_FOR_MEM_CLEAR 5 //num of resets within window to issue a clear cmd
 #define RESET_WINDOW_MS 5000 // max time between consecutive resets such that they would count towards memory clear
+#define WATCHDOG_TIMEOUT_MINUTES 14
+#define WATCHDOG_TIMEOUT_SEC (WATCHDOG_TIMEOUT_MINUTES * 60)
+#define BLOCKS_PER_SEC 10
+#define SAMPLES_PER_BLOCK (SPS / BLOCKS_PER_SEC)
+#define NO_MOVEMENT_THRESH_SEC 4
+#define DEPOSIT_END_THRESH_SEC (NO_MOVEMENT_THRESH_SEC * 2) // require box to be quite for long time before declaring deposit is over
+#define MAX_NO_MOVEMENT_MAD 30
+
+//Impulse detection params
+#define CANDIDATE_OFFSET_SEC NO_MOVEMENT_THRESH_SEC // only after 2 quite seconds do we start looking for impulses
+#define BASELINE_SIZE_SAMP 55 //~550ms before and after each candidate
+#define CANDIDATE_SIZE_SAMP 11
+#define POO_IMPULSE_THRESH_G 120
+#define CANDIDATE_SURROUNDING_MAD_MAX_G 25
+#define IMPULSE_RATIO_THRESH 10
+#define TRANSIENT_CNT_THRESH 3
+#define IMPULSE_COOLDOWN_SAMP 30
+#define CANDIDATE_CURRENT_SECOND_MASK (((uint32_t)1) << (CANDIDATE_OFFSET_SEC - 1))
 
 #define LED_TOGGLE digitalWrite(LED_BUILTIN, HIGH); delay(500); digitalWrite(LED_BUILTIN, LOW);
 
 Preferences stateNVM;
 
-enum fsm_state
+enum FsmState
 {
-  idle,
-  deposit,
-  clean
+  idle,         // 0
+  deposit,      // 1 
+  clean,        // 2
+  test          // 3
 };
 
-volatile SemaphoreHandle_t oneSecSemaphore;
+enum DepositPhase
+{
+  preElimination, // 0
+  elimination,     // 1 
+  postElimination // 2
+};
+
+volatile SemaphoreHandle_t oneSecondSemaphore;
 volatile SemaphoreHandle_t lidSemaphore;
 volatile uint32_t secCounter = 0;
-volatile uint32_t depositTimerSec = 0;
-static fsm_state state = idle;
+
+static FsmState state = idle;
+static DepositPhase depositPhase = preElimination;
+
+static uint32_t depositTimerSec = 0;
 static uint32_t loopCount = 0;
-static uint32_t snapshotLoopCount[SNAPSHOT_INTERVAL_MIN] = {0};
-static uint32_t snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
+static uint32_t snapshotLoopCount[SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN] = {0};
+static uint32_t snapshotTimer = SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN;
 static uint32_t sampleCount = 0;
-static uint32_t transientCoundown = 0;
+static uint32_t samplesThisSecond = 0;
+static uint32_t impulseCooldown = 0;
 static uint32_t lastSamplePrint = 0;
 static uint32_t lastReport = 0;
 static uint32_t lastZero = 0;
 static int32_t currentSample_g = 0;
 static int32_t previousSample_g = 0;
-static int32_t secSample_g[SETTLING_TIMME_SEC] = {0};
-static int32_t windowMax_g = 0;
-static int32_t windowMin_g = 0;
-static int32_t windowAvg_g = 0;
-static int32_t delta_g = 0;
+static uint32_t sampleBufferHead = 0;
+static int32_t sampleBuffer[SAMPLE_BUFFER_SIZE] = {0};
+static int32_t blockAvg[BLOCKS_PER_SEC] = {0};
+static int32_t blockAbsDeviation[BLOCKS_PER_SEC] = {0};
+static int32_t oneSecondMAD = 0;
+static int32_t oneSecondMax = 0;
+static int32_t oneSecondMin = 0;
+static int32_t oneSecondMedian[NO_MOVEMENT_THRESH_SEC] = {0};
+static int32_t baselineSamples[2 * BASELINE_SIZE_SAMP];
+static uint32_t candidateStartIndex;
+static uint32_t preBaselineStartIndex;
+static uint32_t postBaselineStartIndex;
+static int32_t impulseCandMax;
+static int32_t impulseCandMin;
+static int32_t baseline;
+static int32_t localMAD;
+static int32_t candP2P;
 static int32_t depositWeight = 0;
+static int32_t catWeightSamplesCount = 0;
 static int32_t catWeight = 0;
+static int32_t quietSec = 0;
+static int32_t pooTransientCnt = 0;
+static bool quietPeriodLax = false;
+static bool quietPeriodStrict = false;
 static bool zeroingInterval = false;
-static bool oneSecInterval  = false;
-static bool steadyState = false;
-static bool isNumberTwo = false;
+static bool oneSecondTick  = false;
+static bool pooDetected = false;
+static bool isLidClosed = true;
 Logger logger;
 ADS1256 scale;
 rfidReader rfid(Serial1);
-static const char *catID;
-static bool clear_mem   = false;
-static bool clear_cred  = false;
-static bool clear_scale = false;
-hw_timer_t *oneSecTimer = NULL;
+static const char *catId;
+static bool clearMem   = false;
+static bool clearCred  = false;
+static bool clearScale = false;
+hw_timer_t *oneSecondTimer = NULL;
 
-void remote_settings();
-void tare_scale();
-void check_user_button();
-void user_button_func();
+void remoteSettings();
+void tareScale();
+void checkUserButton();
+void userButtonFunc();
 void periodicals();
-void idle_func();
-void deposit_func();
-void clean_func();
-void rfid_only();
-void scale_fsm();
-void check_zero();
+void idleFunc();
+void depositFunc();
+void finalizeDeposit(bool overlength = false);
+void cleanFunc();
+void rfidOnly();
+void scaleFsm();
+void checkZero();
+void calculateOneSecondStats();
 
-void IRAM_ATTR oneSecISR()
+void IRAM_ATTR oneSecondISR()
 {
   secCounter++;
-  xSemaphoreGiveFromISR(oneSecSemaphore, NULL);
+  xSemaphoreGiveFromISR(oneSecondSemaphore, NULL);
   return;
 }
 
@@ -107,14 +159,21 @@ void IRAM_ATTR lidISR()
 
 void setup()
 {
-  stateNVM.begin("resets_nvm", false);
+  const esp_reset_reason_t reason = esp_reset_reason();
+  const bool watchdogReset = ((reason == ESP_RST_TASK_WDT) || (reason == ESP_RST_INT_WDT) || (reason == ESP_RST_WDT));
+  stateNVM.begin("resetsNvm", false);
   int32_t resetCount = stateNVM.getInt("rstCount");
   stateNVM.putInt("rstCount", resetCount + 1);
   delay(RESET_WINDOW_MS);
-  clear_mem = false;
+  clearMem = false;
+  #if DEBUG
+    // clearMem = true;
+    state= test;
+  #endif
+  
   if (resetCount >= RESETS_FOR_MEM_CLEAR)
   {
-    clear_mem = true;
+    clearMem = true;
     stateNVM.putInt("rstCount", 0);
   }
   stateNVM.putInt("rstCount", 0);
@@ -127,7 +186,7 @@ void setup()
   }
   Serial.printf("Starting\n RST Cnt: %d\n", resetCount);
   
-  if (clear_mem)
+  if (clearMem)
   {
     resetCount = 0;
     Serial.println("Memory clear pattern detected, would you like to clear WiFi credentials? [Y/N]");
@@ -140,13 +199,13 @@ void setup()
         res = Serial.readStringUntil('\n');
         if (res.startsWith("Y"))
         {
-          clear_cred = true;
+          clearCred = true;
           Serial.println("WiFi credentials will be CLEARED!");
           break;
         }
         else if (res.startsWith("N"))
         {
-          clear_cred = false;
+          clearCred = false;
           Serial.println("Will NOT clear WiFi credentials");
           break;
         }
@@ -160,13 +219,13 @@ void setup()
         res = Serial.readStringUntil('\n');
         if (res.startsWith("Y"))
         {
-          clear_scale = true;
+          clearScale = true;
           Serial.println("Scale parameters will be CLEARED!");
           break;
         }
         else if (res.startsWith("N"))
         {
-          clear_scale = false;
+          clearScale = false;
           Serial.println("Will NOT clear scale pararmeters");
           break;
         }
@@ -174,14 +233,25 @@ void setup()
     }
     res.clear();
   }
-  logger.initLogger(clear_cred);
+  logger.initLogger(clearCred);
   rfid.begin();
 #ifndef NO_SCALE
   SPI.begin(SCALE_CLK, SCALE_MISO, SCALE_MOSI);
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
-  scale.begin(clear_scale);
+  scale.begin(clearScale);
   Serial.println("ADS1256 Configured, starting sampling loop");
 #endif
+
+  if (watchdogReset)
+  {
+    logger.event_type("Boot - watchdog");
+  }
+  else
+  {
+    logger.event_type("Boot - normal");
+  }
+  logger.event_sample(0);
+  logger.event_send();
   
   lidSemaphore = xSemaphoreCreateBinary();
   pinMode(USER_BUTTON, INPUT_PULLUP);
@@ -190,33 +260,46 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   
-  oneSecSemaphore = xSemaphoreCreateBinary();
+  oneSecondSemaphore = xSemaphoreCreateBinary();
   esp_timer_init();
-  oneSecTimer = timerBegin(0, (APB_CLK_FREQ / TICKS_PER_SEC), true);
-  timerAttachInterrupt(oneSecTimer, &oneSecISR, true);
-  timerAlarmWrite(oneSecTimer, TICKS_PER_SEC, true);
-  timerAlarmEnable(oneSecTimer);
-  snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
+  oneSecondTimer = timerBegin(0, (APB_CLK_FREQ / TICKS_PER_SEC), true);
+  timerAttachInterrupt(oneSecondTimer, &oneSecondISR, true);
+  timerAlarmWrite(oneSecondTimer, TICKS_PER_SEC, true);
+  timerAlarmEnable(oneSecondTimer);
+  snapshotTimer = SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN;
+
+  ESP_ERROR_CHECK(esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true));
+  ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 }
 
 void loop()
 {
-  check_user_button();
+  checkUserButton();
   periodicals();
 #ifndef NO_SCALE
-  scale_fsm();
+  scaleFsm();
 #else// #ifndef NO_SCALE
-  rfid_only();
+  rfidOnly();
 #endif
   loopCount++;
 }
 
-inline void scale_fsm()
+inline void scaleFsm()
 {
   if (scale.available())
   {
+    sampleBuffer[sampleBufferHead] = previousSample_g;
+    sampleBufferHead = (sampleBufferHead + 1) % SAMPLE_BUFFER_SIZE;
     previousSample_g = currentSample_g;
     currentSample_g = scale.getWeight();
+    samplesThisSecond++;
+    if (oneSecondTick)
+    {
+      calculateOneSecondStats();
+      if (samplesThisSecond != SPS)
+      {/*flag problem*/}
+      samplesThisSecond = 0;
+    }
 #ifdef SCALE_DEBUG
     delay(1000); // reduce loop rate to 1SPS
     Serial.printf("current sample: %d grams, %d counts\n", currentSample_g, scale.getSample());
@@ -224,23 +307,32 @@ inline void scale_fsm()
     switch (state)
     {
       case idle:
-        idle_func();
+        idleFunc();
         break;
       case deposit:
-        deposit_func();
+        depositFunc();
         break;
       case clean:
-        clean_func();
+        cleanFunc();
+        break;
+      case test:
+        if (oneSecondTick)
+        {
+          logger.event_sample(currentSample_g);
+          logger.event_type("debug-test");
+          logger.event_send();
+        }
+        state = test;
         break;
     }
 #endif // #ifdef SCALE_DEBUG
-    oneSecInterval = false;
+    oneSecondTick = false;
   }
 }
 
-inline bool send_remote_cmd(rcommand cmd, int32_t arg = 0)
+inline bool sendRemoteCmd(rcommand cmd, int32_t arg = 0)
 {
-  int32_t timeout = REMOTE_SETTINGS_TIMEOUT_S;
+  int32_t timeout = REMOTE_SETTINGS_TIMEOUT_SEC;
   while(timeout--)
   {
     if (logger.remote_setting(cmd, arg) != 0)
@@ -250,18 +342,18 @@ inline bool send_remote_cmd(rcommand cmd, int32_t arg = 0)
   return ((timeout == 0) ? false : true);
 }
 
-void remote_settings()
+void remoteSettings()
 {
   Serial.println("Entered remote settings mode");
-  if (!send_remote_cmd(start))
+  if (!sendRemoteCmd(start))
     return;
   Serial.println("Offset cal");
   int32_t offset = scale.getSample();
-  if (!send_remote_cmd(req_tare, offset))
+  if (!sendRemoteCmd(req_tare, offset))
     return;
   scale.setManOffset(offset);
   delay(100);
-  if (!send_remote_cmd(ack_tare, scale.getSample() - offset))
+  if (!sendRemoteCmd(ack_tare, scale.getSample() - offset))
     return;
   int32_t factor;
   Serial.println("Factor cal");
@@ -278,43 +370,57 @@ void remote_settings()
   Serial.println("Exiting remote settings");
 }
 
-inline void check_user_button()
+inline void checkUserButton()
 {
   if (!digitalRead(USER_BUTTON))
   {
     Serial.println("userbutton pressed");
-    int32_t hold_cnt = 0;
-    for (;hold_cnt < SETTING_HOLD_THRESH_S * 10; hold_cnt++) // check every 100ms
+    int32_t holdCnt = 0;
+    for (;holdCnt < SETTING_HOLD_THRESH_SEC * 10; holdCnt++) // check every 100ms
     {
       delay(100);
       if(digitalRead(USER_BUTTON))
         break;
     }
-    if (hold_cnt == SETTING_HOLD_THRESH_S * 10)
-      user_button_func();
+    if (holdCnt == SETTING_HOLD_THRESH_SEC * 10)
+      userButtonFunc();
   }
 }
 
-inline void user_button_func()
+inline void userButtonFunc()
 {
   detachInterrupt(LID_GPIO);
-  // remote_settings();
+  // remoteSettings();
   LED_TOGGLE
   delay(500);
-  tare_scale();
+  tareScale();
   state = idle;
   attachInterrupt(LID_GPIO, lidISR, RISING);
 }
 
-inline void tare_scale()
+inline void tareScale()
 {
   while(!digitalRead(USER_BUTTON)) //wait for button release
   {
     delay(100);
   }
   delay(1000);
-  scale.setManOffset(scale.getSample());
-  int32_t baseWeight = scale.getWeight();
+  while (true)
+  {
+    if(scale.available())
+    {
+      scale.setManOffset(scale.getSample());
+      break;
+    }
+    delay(50);
+  }
+  while (true)
+  {
+    if(scale.available())
+      break;
+    delay(50);
+  }
+  int32_t baseWeight = scale.getWeight(); //should be ~0
   Serial.println("Scale tared");
   LED_TOGGLE // confirm offset saved
   delay(500);
@@ -325,12 +431,19 @@ inline void tare_scale()
     delay(1000);
     Serial.println("Waiting for lid closure");
     digitalWrite(LED_BUILTIN, HIGH);
-    // if ((scale.getWeight() - baseWeight > MIN_BOX_WEIGHT_G) && (!digitalRead(LID_GPIO)))
     if (!digitalRead(LID_GPIO))
     {
-      delay(1000);
+      delay(2000);
       Serial.println("Lid closed, updating box weight");
-      scale.updateBoxWeight();
+      while(true)
+      {
+        if(scale.available())
+        {
+          scale.updateBoxWeight(scale.getWeight()); // lazy solution, no averaging/settling
+          break;
+        }
+        delay(50);
+      }
       Serial.println("Box weight updated, sending event");
       logger.event_type("scale_tare");
       logger.event_sample(baseWeight);
@@ -339,8 +452,8 @@ inline void tare_scale()
       LED_TOGGLE
       delay(500);
       LED_TOGGLE
-      break;
       state = idle;
+      break;
     }
   }
   Serial.println("Event sent, resuming normal operation");
@@ -348,8 +461,14 @@ inline void tare_scale()
 
 inline void periodicals()
 {
-  if (xSemaphoreTake(oneSecSemaphore, 0) == pdTRUE)
+  if (xSemaphoreTake(oneSecondSemaphore, 0) == pdTRUE)
     {
+      if (rfid.available())
+      {
+        catId = rfid.getLastTagRead();
+        logger.event_catID(String(catId));
+      }
+
       if (secCounter - lastZero >= ZEROING_INTERVAL_SEC)
       {
         zeroingInterval = true;
@@ -366,24 +485,25 @@ inline void periodicals()
         Serial.printf("%d loop count in last %d seconds\n", loopCount, REPORT_INTERVAL_MIN * 60);
         Serial.printf("Current state: %d\n", state);
         Serial.printf("Box weight: %d\n", scale.getBoxWeight());
+        Serial.printf("Actuall SPS: %d\n", samplesThisSecond + 1);
 #if SEND_SNAPSHOT
-        snapshotLoopCount[--snapeshotTimer] = loopCount;
-        if (snapeshotTimer == 0)
+        snapshotLoopCount[--snapshotTimer] = loopCount;
+        if (snapshotTimer == 0)
         {
           uint32_t avg = snapshotLoopCount[0];
           uint32_t max = snapshotLoopCount[0];
           uint32_t min = snapshotLoopCount[0];
-          for (int i = 1; i < SNAPSHOT_INTERVAL_MIN; i++)
+          for (size_t i = 1; i < SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN; i++)
           {
             max = (snapshotLoopCount[i] > max) ? snapshotLoopCount[i] : max;
             min = (snapshotLoopCount[i] < min) ? snapshotLoopCount[i] : min;
             avg += snapshotLoopCount[i];
           }
-          avg = avg / SNAPSHOT_INTERVAL_MIN;
+          avg = avg / (SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN);
           char json [256];
           snprintf (json, sizeof(json),"{\"Type\":\"Snapshot\",\"LoopCnt Avg\":\"%d\", \"LoopCnt Max\":\"%d\", \"LoopCnt Min\":\"%d\", \"State\":\"%d\", \"Current boxWeight\":\"%d\", \"Current weight\":\"%d\"}", avg, max, min, state, scale.getBoxWeight(), scale.getWeight());
           logger.post_event(String(json));
-          snapeshotTimer = SNAPSHOT_INTERVAL_MIN;
+          snapshotTimer = SNAPSHOT_INTERVAL_MIN / REPORT_INTERVAL_MIN;
         }
 #endif
 
@@ -391,149 +511,294 @@ inline void periodicals()
         loopCount = 0;
       }
 #endif
-      oneSecInterval = true;
+      oneSecondTick = true;
     }
 }
 
-inline void idle_func()
+inline void idleFunc()
 {
+  ESP_ERROR_CHECK(esp_task_wdt_reset());
+
   if (xSemaphoreTake(lidSemaphore, 0) == pdTRUE)
   {
-    detachInterrupt(LID_GPIO);
-    state = clean;
+    delay(500); // debounce
+    if(digitalRead(LID_GPIO)) //verify lid is open
+    {
+      detachInterrupt(LID_GPIO);
+      isLidClosed = false;
+      state = clean;
+    }
   }
-  else if ((currentSample_g - scale.getBoxWeight() > CAT_THRESH_G) && oneSecInterval) // A cat is inside the box! align to sec counter
+  else if ((currentSample_g - scale.getBoxWeight() > CAT_THRESH_G) && oneSecondTick) // A cat is inside the box! align to sec counter
   {
     state = deposit;
+    depositPhase = preElimination;
+    quietSec = 0;
     depositTimerSec = 0;
     sampleCount = 0;
-    steadyState = false;
+    pooDetected = false;
+    for (size_t i = 0; i < SAMPLE_BUFFER_SIZE; i++)
+    {
+      logger.event_sample(sampleBuffer[(sampleBufferHead + i) % SAMPLE_BUFFER_SIZE]);
+    }
   }
   else if (zeroingInterval)
   {
-    check_zero();
+    checkZero();
   }
+  else
+    rfid.available(); // clear misreads
 }
 
-inline void check_zero()
+inline void checkZero()
 {
-  int32_t delta = scale.getBoxWeight() - scale.getWeight();
-  if ((delta > MAX_ZEORING_DELTA_G) || (delta < -MAX_ZEORING_DELTA_G))
+  int32_t delta = scale.getBoxWeight() - currentSample_g;
+  if (((delta > 0) && (delta < MAX_ZEROING_DELTA_G) && (delta > MIN_ZEROING_DELTA_G)) || ((delta < 0) && (delta > -MAX_ZEROING_DELTA_G) && (delta < -MIN_ZEROING_DELTA_G)))
     scale.refreshOffset();
   zeroingInterval = false;
 }
 
-inline void deposit_func()
+inline void depositFunc()
 {
+  candidateStartIndex         = (sampleBufferHead + ((SAMPLE_BUFFER_SEC - CANDIDATE_OFFSET_SEC)* SPS)) % SAMPLE_BUFFER_SIZE;
+  preBaselineStartIndex  = (candidateStartIndex + ((SAMPLE_BUFFER_SEC * SPS) - BASELINE_SIZE_SAMP))   % SAMPLE_BUFFER_SIZE;
+  postBaselineStartIndex = (candidateStartIndex + CANDIDATE_SIZE_SAMP)                           % SAMPLE_BUFFER_SIZE;
+  impulseCandMax  = INT32_MIN;
+  impulseCandMin  = INT32_MAX;
+  baseline = 0;
+  localMAD = 0;
+  candP2P = 0;
   sampleCount++;
   logger.event_sample(currentSample_g);
-  secSample_g[0] += currentSample_g;
-  if (steadyState)
-  {
-    delta_g = currentSample_g - previousSample_g;
-    if (!isNumberTwo)
-    {
-      if (delta_g < DROP_THRESH_G) // very small drop in weight
-      {
-        transientCoundown = MAX_SAMPLES_BETWEEN_TRANSIENT_PARTS;
-      }
-      else if (transientCoundown > 0)
-      {
-        transientCoundown--;
-        if (delta_g > SPIKE_THRESH_G) // weight spike
-        {
-          isNumberTwo = true;
-        }
-      }
-    }
-  }
-
-  if (oneSecInterval) // full second
+  if (oneSecondTick) // full second
   {
     depositTimerSec++;
-    secSample_g[0] = secSample_g[0] / SPS;
-    if ((secSample_g[0] - scale.getBoxWeight() < CAT_THRESH_G ) || (depositTimerSec == MAX_DEPOSIT_LEN_S)) //cat left or timeout
-    {
-      if (rfid.available())
+  }
+  if (depositTimerSec >= MAX_DEPOSIT_LEN_SEC)
+  {
+    finalizeDeposit(true);
+    state = idle;
+    return;
+  }
+  switch (depositPhase)
+  {
+    case preElimination:
+      if (oneSecondTick && quietPeriodStrict) //no movement
       {
-        catID = rfid.getLastTagRead();
-        logger.event_catID(String(catID));
-      }
-      else 
-      {
-        logger.event_catID("Unknown");
-      }
-
-      if (isNumberTwo)
-        logger.event_type("2");
-      else
-        logger.event_type("1");
-
-      isNumberTwo = false;
-      depositWeight = scale.getBoxWeight();
-      scale.updateBoxWeight();
-      depositWeight = scale.getBoxWeight() - depositWeight;
-      logger.event_depositWeight(String(depositWeight));
-      catWeight = windowAvg_g - scale.getBoxWeight();
-      logger.event_catWeight(String(catWeight));
-      logger.event_send();
-      #pragma unroll
-      for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
-      {
-        secSample_g[i] = 0;
-      }
-      state = idle;
-    }
-    else
-    {
-      if (!steadyState)
-      {
-        transientCoundown = 0;
-        windowAvg_g = 0;
-        windowMax_g = secSample_g[0];
-        windowMin_g = secSample_g[0];
-        for (int i = SETTLING_TIMME_SEC; i >= 0; i--)
+        if (oneSecondMedian[0] - scale.getBoxWeight() > CAT_THRESH_G) // got quite and cat's inside
         {
-          windowMax_g = (secSample_g[i] > windowMax_g) ? secSample_g[i] : windowMax_g;
-          windowMin_g = (secSample_g[i] < windowMin_g) ? secSample_g[i] : windowMin_g;
-          windowAvg_g += secSample_g[i];
-          if (i > 0)
+          catWeightSamplesCount = 0;
+          catWeight = 0;
+          pooTransientCnt = 0;
+          impulseCooldown = 0;
+          depositPhase = elimination;
+        }
+        else // got quite but cat left - summerize deposite
+        {
+          depositPhase = postElimination;
+        }
+      }
+    // wait for quiet. of weight drop - abort
+      break;
+    case elimination:
+      // test for poo transient
+      if (!impulseCooldown)
+      {
+        for (size_t i = 0; i < CANDIDATE_SIZE_SAMP; i++)
+        {
+          if (impulseCandMax < sampleBuffer[(candidateStartIndex + i) % SAMPLE_BUFFER_SIZE])
           {
-            secSample_g[i] = secSample_g[i - 1];
+            impulseCandMax = sampleBuffer[(candidateStartIndex + i) % SAMPLE_BUFFER_SIZE];
+          }
+          if (impulseCandMin > sampleBuffer[(candidateStartIndex + i) % SAMPLE_BUFFER_SIZE])
+          {
+            impulseCandMin = sampleBuffer[(candidateStartIndex + i) % SAMPLE_BUFFER_SIZE];
           }
         }
-        windowAvg_g = windowAvg_g / SETTLING_TIMME_SEC;
-        secSample_g[0] = 0;
-        if (windowMax_g - windowMin_g <= STEADY_STATE_THRESH_G)
+        candP2P = impulseCandMax - impulseCandMin;
+        if (candP2P > POO_IMPULSE_THRESH_G)
         {
-          steadyState = true;
-          Serial.println("Steady state");
+          //calculate baseline stats
+          for (size_t i = 0; i < BASELINE_SIZE_SAMP; i++)
+          {
+            baselineSamples[i] = sampleBuffer[(preBaselineStartIndex + i) % SAMPLE_BUFFER_SIZE];
+            baselineSamples[i + BASELINE_SIZE_SAMP] = sampleBuffer[(postBaselineStartIndex + i) % SAMPLE_BUFFER_SIZE];
+          }
+          std::sort(baselineSamples, baselineSamples + (2 * BASELINE_SIZE_SAMP));
+          baseline = (baselineSamples[BASELINE_SIZE_SAMP - 1] + baselineSamples[BASELINE_SIZE_SAMP]) / 2;
+          for (size_t i = 0; i < BASELINE_SIZE_SAMP; i++)
+          {
+            baselineSamples[i] = (baselineSamples[i] >= baseline) ? baselineSamples[i] - baseline : baseline - baselineSamples[i];
+            baselineSamples[BASELINE_SIZE_SAMP + i] = (baselineSamples[BASELINE_SIZE_SAMP + i] >= baseline) ? baselineSamples[BASELINE_SIZE_SAMP + i] - baseline : baseline - baselineSamples[BASELINE_SIZE_SAMP + i];
+          }
+          std::sort(baselineSamples, baselineSamples + (2 * BASELINE_SIZE_SAMP));
+          localMAD = (baselineSamples[BASELINE_SIZE_SAMP - 1] + baselineSamples[BASELINE_SIZE_SAMP]) / 2;
+          // compare with thresholds
+          if (localMAD < CANDIDATE_SURROUNDING_MAD_MAX_G)
+          {
+            float ratio = (float)candP2P / (float)max(localMAD, 1);
+            if (ratio > IMPULSE_RATIO_THRESH) // impulse detected!
+            {
+              pooTransientCnt++;
+              impulseCooldown = IMPULSE_COOLDOWN_SAMP;
+              logger.event_sample(-1000); // mark transiant
+              // determine poo qualification
+              if (pooTransientCnt >= TRANSIENT_CNT_THRESH)
+              {
+                pooDetected = true;
+              }
+            }
+          }
         }
-      } 
+        else // low p2p
+        {
+          if (oneSecondTick && (quietSec & CANDIDATE_CURRENT_SECOND_MASK))
+          {
+            catWeight+=oneSecondMedian[CANDIDATE_OFFSET_SEC - 1];
+            catWeightSamplesCount++;
+          }
+        } 
+      }
+      else
+      {
+        impulseCooldown--;
+      }
+
+      if (!quietPeriodLax || ((abs(oneSecondMedian[0] - scale.getBoxWeight()) < CAT_THRESH_G) && (abs(currentSample_g - scale.getBoxWeight()) < CAT_THRESH_G))) // movement or cat left
+      {
+        depositPhase = postElimination;
+      }
+      break;
+    case postElimination:
+      if (oneSecondTick && quietPeriodStrict) //no movement
+      {
+        if (oneSecondMedian[0] - scale.getBoxWeight() > MAX_DEPOSIT_WEIGHT_G) // cat still inside TODO: verify it's the same cat!
+        {
+          pooTransientCnt = 0;
+          impulseCooldown = 0;
+          depositPhase = elimination;
+        }
+        else if (quietSec >= DEPOSIT_END_THRESH_SEC) // box is empty for a while
+        {
+          finalizeDeposit();
+          state = idle;
+        }
+      }
+      break;
+  }
+}
+
+void calculateOneSecondStats()
+{
+  oneSecondMax = INT32_MIN;
+  oneSecondMin = INT32_MAX;
+  for (size_t i = NO_MOVEMENT_THRESH_SEC - 1; i > 0; i--)
+  {
+    oneSecondMedian[i] = oneSecondMedian[i - 1];
+  }
+  for (size_t i = 0; i < BLOCKS_PER_SEC; i++)
+  {
+    blockAvg[i] = 0;
+    for (size_t j = 0; j < SAMPLES_PER_BLOCK; j++)
+    {
+      blockAvg[i] += sampleBuffer[(sampleBufferHead + (((SAMPLE_BUFFER_SEC - 1) * SPS) + (i * SAMPLES_PER_BLOCK)) + j) % SAMPLE_BUFFER_SIZE];
+    }
+    blockAvg[i] = blockAvg[i] / SAMPLES_PER_BLOCK;
+    oneSecondMax = (blockAvg[i] > oneSecondMax) ? blockAvg[i] : oneSecondMax;
+    oneSecondMin = (blockAvg[i] < oneSecondMin) ? blockAvg[i] : oneSecondMin;
+  }
+  std::sort(blockAvg, blockAvg + BLOCKS_PER_SEC);
+  oneSecondMedian[0] = (blockAvg[(BLOCKS_PER_SEC / 2) - 1] + blockAvg[BLOCKS_PER_SEC / 2]) / 2;
+  for (size_t i = 0; i < BLOCKS_PER_SEC; i++)
+  {
+    blockAbsDeviation[i] = (blockAvg[i] >= oneSecondMedian[0]) ? blockAvg[i] - oneSecondMedian[0] : oneSecondMedian[0] - blockAvg[i];
+  }
+  std::sort(blockAbsDeviation, blockAbsDeviation + BLOCKS_PER_SEC);
+  oneSecondMAD = (blockAbsDeviation[(BLOCKS_PER_SEC / 2) - 1] + blockAbsDeviation[BLOCKS_PER_SEC / 2]) / 2;
+
+  quietSec <<= 1; // advance buffer
+  if (oneSecondMAD < MAX_NO_MOVEMENT_MAD)
+  {
+    quietSec++;
+  }
+
+  //asses period
+  quietPeriodStrict = true;
+  quietPeriodLax = true;
+  for (size_t i = 0; i < NO_MOVEMENT_THRESH_SEC; i++)
+  {
+    if (!((quietSec >> i) & (uint32_t)1))
+    {
+      quietPeriodLax = quietPeriodStrict;
+      quietPeriodStrict = false;
     }
   }
 }
 
-inline void clean_func()
+void finalizeDeposit(bool overlength)
 {
-  if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+  if (depositTimerSec > MIN_DEPOSIT_TIME_SEC)
   {
-    delay(1000); // debunce connection and verify
+    if (catWeightSamplesCount > 1)
+    {
+      catWeight = catWeight / catWeightSamplesCount;
+    }
+    if (!overlength)
+    {
+      if (pooDetected)
+        logger.event_type("2");
+      else
+        logger.event_type("1");
+      depositWeight = oneSecondMedian[0] - scale.getBoxWeight(); //current - previous
+      logger.event_depositWeight(String(depositWeight));
+      catWeight = catWeight - oneSecondMedian[0]; // catWeight prelodad with avg during deposit, subtract current box weight
+      scale.updateBoxWeight(oneSecondMedian[0]);
+    }
+    else
+    {
+      logger.event_type("over_length");
+    }
+    logger.event_catWeight(String(catWeight));
+  }
+  else
+  {
+    logger.event_type("Aborted");
+  }
+  logger.event_send();
+}
+
+inline void cleanFunc()
+{
+  if (!isLidClosed)
+  {
     if (!digitalRead(LID_GPIO)) //reading low -> lid closed
     {
+      delay(1000); // debunce connection and verify
+      if (!digitalRead(LID_GPIO)) //reading low -> lid closed
+      {
+        isLidClosed = true;
+        quietSec = 0;
+      }
+    }
+  }
+
+  if(oneSecondTick && isLidClosed)
+  {
+    if(quietPeriodStrict)
+    {
       logger.event_sample(scale.getBoxWeight());
-      scale.updateBoxWeight();
-      logger.event_sample(scale.getBoxWeight());
+      scale.updateBoxWeight(oneSecondMedian[0]);
+      logger.event_sample(oneSecondMedian[0]);
       logger.event_type("Clean");
       logger.event_send();
-      state = idle;
       rfid.restart();
+      state = idle;
       attachInterrupt(LID_GPIO, lidISR, RISING);
     }
   }
 }
 
-inline void rfid_only()
+inline void rfidOnly()
 {
   if (state == clean)
   {
@@ -550,8 +815,8 @@ inline void rfid_only()
   else if (rfid.available())
   {
     logger.event_sample(1);
-    catID = rfid.getLastTagRead();
-    logger.event_catID(String(catID));
+    catId = rfid.getLastTagRead();
+    logger.event_catID(String(catId));
     logger.event_type("rfid_only");
     logger.event_send();
   }
